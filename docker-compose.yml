@@ -1,0 +1,51 @@
+version: '3.8'
+services:
+  db:
+    image: timescale/timescaledb:latest-pg12
+    hostname: pg
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrations:
+    image: postgres
+    volumes:
+      - ./data/cpu_usage.sql:/cpu_usage.sql
+      - ./data/cpu_usage.csv:/cpu_usage.csv
+    command: psql -h db -U postgres -f cpu_usage.sql
+    environment:
+      PGPASSWORD: postgres
+    depends_on:
+      db:
+        condition: service_healthy
+
+  integration_test:
+    image: golang
+    volumes:
+      - .:/usr/src/bench
+      - /tmp/go:/go
+    working_dir: /usr/src/bench
+    command: go test ./...
+    environment:
+      PG_DSN: postgres://postgres:postgres@pg:5432/postgres
+    depends_on:
+      db:
+        condition: service_healthy
+
+  bench:
+    image: docker.io/ravlio/ts-bench:0.1.0
+    command: -pg-dsn="postgres://postgres:postgres@pg:5432/postgres"
+    depends_on:
+      - migrations
+
+volumes:
+  db:
+    driver: local
