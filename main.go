@@ -13,7 +13,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,11 +27,15 @@ const queryTimeBufferSize = 10_000
 type metrics struct {
 	queriesProcessed    uint64
 	queryErrors         uint64
-	totalProcessingTime uint64
-	minQueryTime        uint64
-	maxQueryTime        uint64
+	totalProcessingTime time.Duration
+	minQueryTime        time.Duration
+	maxQueryTime        time.Duration
 	queryTime           []float64
-	queryTimeMx         sync.Mutex
+}
+
+type queryResult struct {
+	err            error
+	processingTime time.Duration
 }
 
 // a task is a task payload for querying
@@ -44,15 +47,16 @@ type task struct {
 
 // a bench is a benchmarking tool
 type bench struct {
-	metrics      *metrics
+	metrics      metrics
 	pool         *pgxpool.Pool
 	csvReader    *csv.Reader
 	workersCount int
 	scanRows     bool
 	// buffered task buffer for each worker
 	// tasks are mapped to workers by hostname hash
-	tasksCh []chan task
-	tasksWg sync.WaitGroup
+	tasksCh   []chan task
+	metricsCh chan queryResult
+	tasksWg   sync.WaitGroup
 }
 
 type options struct {
@@ -68,18 +72,19 @@ func newBench(opts *options) *bench {
 		queriesProcessed:    0,
 		queryErrors:         0,
 		totalProcessingTime: 0,
-		minQueryTime:        math.MaxUint64,
+		minQueryTime:        time.Duration(math.MaxInt64),
 		maxQueryTime:        0,
 		// queryTime handles a series of query processing times to be able to calculate median and percentiles
 		queryTime: make([]float64, 0, queryTimeBufferSize),
 	}
 	b := &bench{
-		metrics:      &m,
+		metrics:      m,
 		pool:         opts.pool,
 		scanRows:     opts.scanRows,
 		csvReader:    csv.NewReader(opts.csvReader),
 		workersCount: opts.workersCount,
 		tasksCh:      make([]chan task, opts.workersCount),
+		metricsCh:    make(chan queryResult, opts.workersCount),
 	}
 
 	// initialize buffered task channel for each worker
@@ -98,6 +103,8 @@ func (b *bench) run(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+
+	go b.runMetrics(ctx)
 
 	fmt.Printf("%d tasks were loaded\n", len(tasks))
 	go func() {
@@ -130,8 +137,42 @@ func (b *bench) run(ctx context.Context) (err error) {
 	}
 
 	b.tasksWg.Wait()
+	close(b.metricsCh)
 
 	return
+}
+
+// runMetrics runs metric collector which collects metrics from workers
+func (b *bench) runMetrics(ctx context.Context) {
+	for m := range b.metricsCh {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if m.err != nil {
+			b.metrics.queryErrors++
+			continue
+		}
+
+		b.metrics.queriesProcessed++
+		b.metrics.totalProcessingTime++
+
+		// store all the rest metrics
+		b.metrics.totalProcessingTime += m.processingTime
+		if m.processingTime < b.metrics.minQueryTime {
+			b.metrics.minQueryTime = m.processingTime
+		}
+		if m.processingTime >= b.metrics.maxQueryTime {
+			b.metrics.maxQueryTime = m.processingTime
+		}
+
+		// We store each query time as an individual value in slice
+		// so that we can apply statistic functions like median and percentiles
+		// it may be memory inefficient
+		b.metrics.queryTime = append(b.metrics.queryTime, float64(m.processingTime))
+	}
 }
 
 // readTasks reads csv file and sends tasks hashed by hostname to workers
@@ -201,33 +242,7 @@ Loop:
 
 			// run query
 			err = b.query(ctx, t.hostname, t.from, t.to)
-			if err != nil {
-				// increase error metrics
-				atomic.AddUint64(&b.metrics.queryErrors, 1)
-				fmt.Fprintf(os.Stderr, "query error: %s\n", err.Error())
-
-				continue
-			} else {
-				atomic.AddUint64(&b.metrics.queriesProcessed, 1)
-			}
-
-			// store all the rest metrics
-			spent := uint64(time.Since(start))
-			atomic.AddUint64(&b.metrics.totalProcessingTime, spent)
-			if spent < atomic.LoadUint64(&b.metrics.minQueryTime) {
-				atomic.StoreUint64(&b.metrics.minQueryTime, spent)
-			}
-			if spent >= atomic.LoadUint64(&b.metrics.maxQueryTime) {
-				atomic.StoreUint64(&b.metrics.maxQueryTime, spent)
-			}
-
-			// We store each query time as an individual value in slice
-			// so that we can apply statistic functions like median and percentiles
-			// it may be memory inefficient
-			// WARNING:
-			b.metrics.queryTimeMx.Lock()
-			b.metrics.queryTime = append(b.metrics.queryTime, float64(spent))
-			b.metrics.queryTimeMx.Unlock()
+			b.metricsCh <- queryResult{processingTime: time.Since(start), err: err}
 		}
 	}
 
@@ -278,29 +293,24 @@ func (b *bench) displayMetrics(w io.Writer) error {
 	sb := strings.Builder{}
 
 	// single counter metrics
-	queriesProcessed := atomic.LoadUint64(&b.metrics.queriesProcessed)
-	sb.Write([]byte(fmt.Sprintf("queries processed: %d\n", queriesProcessed)))
+	sb.Write([]byte(fmt.Sprintf("queries processed: %d\n", b.metrics.queriesProcessed)))
 
-	queryErrors := atomic.LoadUint64(&b.metrics.queryErrors)
-	sb.Write([]byte(fmt.Sprintf("query errors: %d\n", queryErrors)))
+	sb.Write([]byte(fmt.Sprintf("query errors: %d\n", b.metrics.queryErrors)))
 
-	totalProcessingTime := atomic.LoadUint64(&b.metrics.totalProcessingTime)
-	sb.Write([]byte(fmt.Sprintf("total processing time: %s\n", displayDuration(totalProcessingTime))))
+	sb.Write([]byte(fmt.Sprintf("total processing time: %s\n", b.metrics.totalProcessingTime)))
 
-	if queriesProcessed == 0 {
+	if b.metrics.queriesProcessed == 0 {
 		_, err := w.Write([]byte(sb.String()))
 
 		return err
 	}
 
-	minQueryTime := atomic.LoadUint64(&b.metrics.minQueryTime)
-	sb.Write([]byte(fmt.Sprintf("min query time: %s\n", displayDuration(minQueryTime))))
+	sb.Write([]byte(fmt.Sprintf("min query time: %s\n", b.metrics.minQueryTime)))
 
-	maxQueryTime := atomic.LoadUint64(&b.metrics.maxQueryTime)
-	sb.Write([]byte(fmt.Sprintf("max query time: %s\n", displayDuration(maxQueryTime))))
+	sb.Write([]byte(fmt.Sprintf("max query time: %s\n", b.metrics.maxQueryTime)))
 
-	avgTime := totalProcessingTime / queriesProcessed
-	sb.Write([]byte(fmt.Sprintf("avg query time: %s\n", displayDuration(avgTime))))
+	avgTime := b.metrics.totalProcessingTime / time.Duration(b.metrics.queriesProcessed)
+	sb.Write([]byte(fmt.Sprintf("avg query time: %s\n", avgTime)))
 
 	// slice metrics
 	median, err := stats.Median(b.metrics.queryTime)
