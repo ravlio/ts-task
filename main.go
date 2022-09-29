@@ -251,13 +251,14 @@ Loop:
 
 // query build query with provided arguments and executes it
 func (b *bench) query(ctx context.Context, hostname string, from, to time.Time) error {
-	const query = `select min(usage),
-						   max(usage),
-						   date_trunc('minute', ts) as ts_min
-					from cpu_usage
-					where host = $1
-					  and ts between $2 and $3
-					group by ts_min`
+	const query = `
+	SELECT time_bucket_gapfill('1 minute', ts) AS minute,
+		min(usage)                          AS min_usage,
+		max(usage)                          AS max_usage
+	FROM cpu_usage
+	where host = $1
+	and ts between $2 and $3
+	GROUP BY minute`
 
 	// execute query
 	rows, err := b.pool.Query(
